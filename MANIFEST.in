@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+include CITATION.cff
+recursive-include src/multivariate_bocd/data *.csv

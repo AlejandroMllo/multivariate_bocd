@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "Multivariate Bayesian Online Changepoint Detection"
+message: "If you use this software, please cite the related IJRR paper listed here."
+authors:
+  - family-names: "Murillo-Gonzalez"
+    given-names: "Alejandro"
+  - family-names: "Liu"
+    given-names: "Lantao"
+doi: "10.1177/02783649261431863"
+url: "https://github.com/AlejandroMllo/multivariate_bocd"
+repository-code: "https://github.com/AlejandroMllo/multivariate_bocd"
+preferred-citation:
+  type: article
+  title: "Situationally-Aware Dynamics Learning"
+  authors:
+    - family-names: "Murillo-Gonzalez"
+      given-names: "Alejandro"
+    - family-names: "Liu"
+      given-names: "Lantao"
+  journal: "The International Journal of Robotics Research"
+  year: 2026
+  doi: "10.1177/02783649261431863"

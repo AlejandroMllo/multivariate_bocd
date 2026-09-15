@@ -1,255 +1,271 @@
+"""Multivariate Bayesian online changepoint detection."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
 import torch
+
+TensorLike = torch.Tensor | Iterable[float]
+
+
+@dataclass(frozen=True)
+class BOCDUpdate:
+    """Result returned after adding one observation."""
+
+    cp_prob: torch.Tensor
+    grow_prob: torch.Tensor
+    run_data: torch.Tensor
 
 
 class BOCD:
-    """
-    Bayesian Online Changepoint Detection (BOCD) Module.
+    """Bayesian Online Changepoint Detection for streaming observations."""
 
-    Based on:
-    Adams, Ryan Prescott, and David JC MacKay. "Bayesian online changepoint detection."
-    arXiv preprint arXiv:0710.3742 (2007).
+    def __init__(self, model: "MultivariateGaussianWishartModel", hazard: float):
+        if not 0.0 < hazard < 1.0:
+            raise ValueError("hazard must be between 0 and 1.")
 
-    Code adapted by Alejandro Murillo-Gonzalez, from the following
-    works by Gregory Gundersen:
-        https://github.com/gwgundersen/bocd/blob/master/bocd.py
-        http://gregorygundersen.com/blog/2019/08/13/bocd/
-        http://gregorygundersen.com/blog/2020/10/20/implementing-bocd/
-    """
+        self._model = model
+        self._hazard = float(hazard)
+        self._num_observations = 0
+        self._log_H = torch.tensor(self._hazard, device=model.device, dtype=model.dtype).log()
+        self._log_1mH = torch.tensor(1.0 - self._hazard, device=model.device, dtype=model.dtype).log()
+        self._log_message = torch.zeros((), device=model.device, dtype=model.dtype)
+        self._log_R = [self._log_message]
+        self.changepoints: list[int] = []
 
-    def __init__(self, model, hazard, device='cuda'):
+    @property
+    def num_observations(self) -> int:
+        """Number of observations processed so far."""
+        return self._num_observations
 
-        self.__model: MultivariateGaussianWishartModel = model     # TODO: Abstract class for the models, i.e., BOCDModel
-        self.__device = device
-        self.__hazard = hazard
-        # self.__data = None
-        self.__num_observations = 0
+    @property
+    def model(self) -> "MultivariateGaussianWishartModel":
+        """Predictive model used by this detector."""
+        return self._model
 
-        # Initialize algorithm
-        self.__log_H = torch.tensor(self.__hazard).log()
-        self.__log_1mH = torch.tensor(1 - self.__hazard).log()
+    def add_observation(self, obs: TensorLike) -> BOCDUpdate:
+        """Process one observation and update the run-length distribution."""
+        obs = self._model.as_tensor(obs)
+        if obs.ndim != 1:
+            raise ValueError("obs must be a one-dimensional observation vector.")
+        if obs.shape[0] != self._model.d:
+            raise ValueError(f"obs has dimension {obs.shape[0]}, expected {self._model.d}.")
 
-        self.__log_message = torch.tensor(1.0).log()       # P(r_0 = 0, x_{0:0} = {}) = 1
-        self.__log_R = [self.__log_message]
-
-        self.changepoints = []
-
-    def add_observation(self, obs):
-        """
-        Perform one iteration of Algorithm 1 from Adams & MacKay (2007),
-        to include the latest observed data into the changepoint analysis.
-        """
-        assert len(obs.shape) == 1
-
-        # Step 2. "Observe New Datum"
-        self.__num_observations += 1
-
-        # Step 3. "Evaluate Predictive Probability"
-        log_pis = self.__model.log_pred_prob(self.__num_observations, obs)  # Vector of length `num_observations`
-
-        # Step 4. "Calculate Growth Probabilities"
-        log_growth_probs = log_pis + self.__log_message + self.__log_1mH  # Vector of length `num_observations`
-
-        # Step 5. "Calculate Changepoint Probability"
-        log_cp_prob = torch.logsumexp(log_pis + self.__log_message + self.__log_H, dim=0)  # Float Scalar
-
-        # Step 6. "Calculate Evidence"
-        new_log_joint = torch.cat([log_cp_prob.unsqueeze(dim=0), log_growth_probs], dim=0)   # Vector of length `num_observations` + 1
-        evidence = torch.logsumexp(new_log_joint, dim=0)             # P(data)
-
-        # Step 7. "Determine Run Length Distribution"
+        self._num_observations += 1
+        log_pis = self._model.log_pred_prob(self._num_observations, obs)
+        log_growth_probs = log_pis + self._log_message + self._log_1mH
+        log_cp_prob = torch.logsumexp(log_pis + self._log_message + self._log_H, dim=0)
+        new_log_joint = torch.cat([log_cp_prob.unsqueeze(dim=0), log_growth_probs], dim=0)
+        evidence = torch.logsumexp(new_log_joint, dim=0)
         log_run_length_prob = new_log_joint - evidence
-        self.__log_R.append(log_run_length_prob)
+        self._log_R.append(log_run_length_prob)
+        self._model.update_params(self._num_observations, obs)
 
-        # Step 8. "Update Sufficient Statistics"
-        self.__model.update_params(self.__num_observations, obs)
-
-        # Misc. Steps:
-        if log_run_length_prob[0] > log_run_length_prob[-1]:      # if changepoint prob > run growth prob:
-            cp = self.__num_observations
-            self.changepoints.append(cp)
-            self.__model.register_changepoint(cp)
-            self.__log_message = torch.tensor(1.0).log()
+        if log_run_length_prob[0] > log_run_length_prob[-1]:
+            changepoint = self._num_observations
+            self.changepoints.append(changepoint)
+            self._model.register_changepoint(changepoint)
+            self._log_message = torch.zeros((), device=self._model.device, dtype=self._model.dtype)
         else:
-            self.__log_message = new_log_joint
+            self._log_message = new_log_joint
 
-        return dict(
+        return BOCDUpdate(
             cp_prob=log_run_length_prob[0].exp(),
             grow_prob=log_run_length_prob[-1].exp(),
-            run_data=self.__model.current_run_data()
+            run_data=self._model.current_run_data(),
         )
-    
-    def run_length_probabilities(self):
 
-        l = len(self.__log_R)
-        run_probs = -torch.inf * torch.ones(l, l)
-        for t, t_probs in enumerate(self.__log_R):
-            
-            r_len = len(t_probs) if len(t_probs.shape) > 0 else 1
-            run_probs[-r_len:, t] = t_probs
+    def fit(self, data: TensorLike) -> "BOCD":
+        """Process a sequence of observations and return ``self``."""
+        data = self._model.as_tensor(data)
+        if data.ndim != 2:
+            raise ValueError("data must be a two-dimensional array.")
+        for obs in data:
+            self.add_observation(obs)
+        return self
 
-        return run_probs.exp().numpy()
+    def run_length_probabilities(self) -> torch.Tensor:
+        """Return a dense matrix of run-length probabilities."""
+        length = len(self._log_R)
+        run_probs = torch.full(
+            (length, length), -torch.inf, device=self._model.device, dtype=self._model.dtype
+        )
+        for timestep, timestep_probs in enumerate(self._log_R):
+            run_length = len(timestep_probs) if timestep_probs.ndim > 0 else 1
+            run_probs[-run_length:, timestep] = timestep_probs
+        return run_probs.exp()
 
 
 class MultivariateGaussianWishartModel:
+    """Gaussian-Wishart style predictive model for BOCD."""
 
-    def __init__(self, mu0, kappa0, nu0, T0, reset_prior_on_changepoint):
-        """
-        Multivariate Gaussian-Wishart prior where both mean and precision parameters are unknonw.
+    def __init__(
+        self,
+        mu0: TensorLike,
+        kappa0: float | torch.Tensor,
+        nu0: float | torch.Tensor,
+        T0: TensorLike,
+        reset_prior_on_changepoint: bool = False,
+        *,
+        regularization: float = 1e-6,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype = torch.float64,
+    ):
+        self.device = torch.device(device) if device is not None else None
+        self.dtype = dtype
+        self.mu0 = self.as_tensor(mu0)
+        self.device = self.mu0.device
+        self.T0 = self.as_tensor(T0)
+        self.kappa0 = self.as_tensor(kappa0)
+        self.nu0 = self.as_tensor(nu0)
 
-        Derivations obtained from:
-        "Conjugate Bayesian analysis of the Gaussian distribution"
-        https://www.cs.ubc.ca/~murphyk/Papers/bayesGauss.pdf
+        if self.mu0.ndim != 1:
+            raise ValueError("mu0 must be one-dimensional.")
+        if self.T0.shape != (self.mu0.shape[0], self.mu0.shape[0]):
+            raise ValueError("T0 must have shape (d, d).")
+        if self.kappa0 <= 0:
+            raise ValueError("kappa0 must be positive.")
+        if self.nu0 <= self.mu0.shape[0] - 1:
+            raise ValueError("nu0 must be greater than d - 1.")
+        if regularization < 0:
+            raise ValueError("regularization must be non-negative.")
 
-        Code adapted by Alejandro Murillo-Gonzalez, from the following
-        works by Gregory Gundersen:
-        https://github.com/gwgundersen/bocd/blob/master/bocd.py
-        http://gregorygundersen.com/blog/2019/08/13/bocd/
-        http://gregorygundersen.com/blog/2020/10/20/implementing-bocd/
-
-        :param mu0:    prior mean vector.
-        :param kappa0: prior scaling factor for the precision matrix of the Gaussian distribution. (Equivalent to prior sample size).
-        :param nu0:    prior degrees of freedom of the Wishart distribution.
-        :param T0:     prior precision matrix.
-        """
-
-        assert len(mu0.shape) == 1
-        assert kappa0 > 0
-        assert nu0 > mu0.shape[0] - 1
-
-        self.__reset_prior_on_changepoint = reset_prior_on_changepoint
-
-        self.d = mu0.shape[0]     # Dimensionality of the data modeled by this distribution.
-        self.mu0 = mu0
-        self.kappa0 = kappa0 if torch.is_tensor(kappa0) else torch.tensor(kappa0)
-        self.nu0 = nu0 if torch.is_tensor(nu0) else torch.tensor(nu0)
-        self.T0 = T0
-
-        self.data = torch.tensor([])
+        self.d = self.mu0.shape[0]
+        self.regularization = float(regularization)
+        self._reset_prior_on_changepoint = bool(reset_prior_on_changepoint)
+        self.data = torch.empty((0, self.d), device=self.device, dtype=self.dtype)
         self.mu_history = self.mu0.clone().unsqueeze(dim=0)
-        self.kappa_history = torch.tensor([self.kappa0], dtype=torch.float64)
-        self.nu_history = torch.tensor([self.nu0], dtype=torch.float64)
+        self.kappa_history = self.kappa0.clone().reshape(1)
+        self.nu_history = self.nu0.clone().reshape(1)
         self.T_history = self.T0.clone().unsqueeze(dim=0)
+        self._changepoints = [0]
 
-        self.__changepoints = [0]
+    def as_tensor(self, value: TensorLike) -> torch.Tensor:
+        """Convert values to this model's dtype and device."""
+        if torch.is_tensor(value):
+            tensor = value
+            if self.device is not None:
+                tensor = tensor.to(device=self.device)
+            return tensor.to(dtype=self.dtype)
+        return torch.as_tensor(value, device=self.device, dtype=self.dtype)
 
-    def register_changepoint(self, timestep):
+    def register_changepoint(self, timestep: int) -> None:
+        """Register a detected changepoint and optionally refresh the prior."""
+        if timestep < 0:
+            raise ValueError("timestep must be non-negative.")
 
-        if self.__reset_prior_on_changepoint:
-            # self.mu0 = self.mu_history[-1]
-            # self.kappa0 = self.kappa_history[-1]
-            # self.nu0 = self.nu_history[-1]
-            # self.T0 = self.T_history[-1]
+        if self._reset_prior_on_changepoint:
+            latest = self.latest_changepoint()
+            run_data = self.data[latest:]
+            if len(run_data) > 0:
+                self.mu0 = run_data.mean(dim=0)
+                self.kappa0 = torch.tensor(float(run_data.shape[0]), device=self.device, dtype=self.dtype)
+                self.nu0 = torch.tensor(float(self.d), device=self.device, dtype=self.dtype)
+                if run_data.shape[0] > self.d:
+                    self.T0 = self._precision_from_data(run_data, fallback=self.T0)
+        self._changepoints.append(int(timestep))
 
-            t = self.latest_changepoint()
-            data = self.data[t:]
-            self.mu0 = data.mean(dim=0)
-            self.kappa0 = torch.tensor(data.shape[0])  # torch.tensor(2)
-            self.nu0 = torch.tensor(data.shape[1])  # torch.tensor(data.shape[0]+1)
-            self.T0 = data.T.cov().inverse() if data.shape[0] > data.shape[1] else self.T0
+    def current_run_data(self) -> torch.Tensor:
+        """Observations seen since the latest registered changepoint."""
+        return self.data[self.latest_changepoint() :]
 
-        self.__changepoints.append(timestep)
-        # print(self.__changepoints)
+    def latest_changepoint(self) -> int:
+        """Most recent changepoint index, using the detector's time base."""
+        return self._changepoints[-1]
 
-    def current_run_data(self):
-        t = self.latest_changepoint()
-        return self.data[t:]
-
-    def latest_changepoint(self):
-        return self.__changepoints[-1]
-    
-    def latest_params(self):
+    def latest_params(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the latest ``mu``, ``kappa``, ``nu``, and ``T`` values."""
         return self.mu_history[-1], self.kappa_history[-1], self.nu_history[-1], self.T_history[-1]
-    
-    def changepoints(self):
-        return self.__changepoints
 
-    def log_pred_prob(self, t, x):
-        """
-        Compute predictive probabilities \pi, i.e. the posterior predictive
-        for each run length hypothesis.
+    def changepoints(self) -> list[int]:
+        """Return changepoints registered by the model."""
+        return list(self._changepoints)
 
-        E.g., if t = 5, the function returns the log-likelihood of `x` for 5
-              parametrizations of the likelihood function (Gaussian in this case),
-              where the parameters \eta_i correspond to \eta_0 = prior, and for
-              i > 0 they are the updated parameters after receiving observation i-1.
-        """
-
-        if not torch.is_tensor(x):
-            x = torch.tensor(x)
-
+    def log_pred_prob(self, t: int, x: TensorLike) -> torch.Tensor:
+        """Compute log predictive probabilities for each run-length hypothesis."""
+        x = self.as_tensor(x)
         t0 = self.latest_changepoint()
-
         means = self.mu_history[t0:t]
-        precisions = self.T_history[t0:t]
+        precisions = self._regularized_precision(self.T_history[t0:t])
+        diffs = x - means
+        quad_form = torch.sum(
+            diffs * torch.matmul(precisions, diffs.unsqueeze(-1)).squeeze(-1), dim=-1
+        )
+        _, logdet_precision = torch.linalg.slogdet(precisions)
+        log_2pi = torch.log(torch.tensor(2.0 * torch.pi, device=self.device, dtype=self.dtype))
+        return -0.5 * quad_form + 0.5 * logdet_precision - 0.5 * self.d * log_2pi
 
-        dist = torch.distributions.MultivariateNormal(loc=means, precision_matrix=precisions)
-        ll = dist.log_prob(x)
-
-        return ll
-
-    def update_params(self, t, x):
-        """Upon observing a new datum x at time t, update all run length 
-        hypotheses.
-
-        Updating the parameters with the observation x at time t, involves
-        updating the previous t parameters \eta_i (0 <= i <= t) and including
-        a new one for the next timestep.
-            Basically the update should be something like: [prior] + [t new parameterizations]
-            where the t new parameterizations consist of applying the update to each previous \eta_i.
-        """
-        if not torch.is_tensor(x):
-            x = torch.tensor(x)
-
+    def update_params(self, t: int, x: TensorLike) -> None:
+        """Update sufficient-statistic histories after observing ``x``."""
+        del t
+        x = self.as_tensor(x)
         self.data = torch.cat([self.data, x.unsqueeze(dim=0)], dim=0)
-
         t0 = self.latest_changepoint()
+        n = torch.tensor(1.0, device=self.device, dtype=self.dtype)
+        data_mean = x
 
-        n = 1 # x.shape[0]
-        data_mean = x  # if n == 1 else torch.mean(x, dim=0)
-
-        # mu_n
-        mu_n = (self.kappa_history.unsqueeze(1) * self.mu0 + n * data_mean) / (self.kappa_history + n).unsqueeze(1)
+        mu_n = (
+            self.kappa_history.unsqueeze(1) * self.mu0 + n * data_mean
+        ) / (self.kappa_history + n).unsqueeze(1)
         self.mu_history = torch.cat([self.mu0.unsqueeze(dim=0), mu_n], dim=0)
 
-        # S_n (symmetric d x d nonnegative definite matrix)
         data_diff = self.data[t0:, :] - data_mean
-        S = torch.matmul(torch.transpose(data_diff, 0, 1), data_diff)
-
-        # T_n
+        S = torch.matmul(data_diff.T, data_diff)
         mean_diff = (self.mu0 - data_mean).reshape(-1, 1)
-        mean_dif_cov = torch.matmul(mean_diff, torch.transpose(mean_diff, 0, 1))
-        # T_n = (d x d) + (d x d) + () * (4 x 4)
-        mean_dif_cov_scale = ((self.kappa_history * n) / (self.kappa_history + n)).view(-1, 1, 1)
-        T_n = self.T0 + S + mean_dif_cov_scale * mean_dif_cov
-
+        mean_diff_cov = torch.matmul(mean_diff, mean_diff.T)
+        mean_diff_scale = ((self.kappa_history * n) / (self.kappa_history + n)).view(-1, 1, 1)
+        T_n = self.T0 + S + mean_diff_scale * mean_diff_cov
         self.T_history = torch.cat([self.T0.unsqueeze(dim=0), T_n], dim=0)
-        # print('T params', mean_diff.shape, mean_dif_cov.shape, T_n.shape, self.T_history.shape, 'T0', self.T0.shape)
+        self.nu_history = torch.cat([self.nu0.unsqueeze(0), self.nu_history + n], dim=0)
+        self.kappa_history = torch.cat([self.kappa0.unsqueeze(0), self.kappa_history + n], dim=0)
 
-        # nu_n
-        nu_n = self.nu_history + n
-        self.nu_history = torch.cat([self.nu0.unsqueeze(0), nu_n], dim=0)
-
-        # kappa_n
-        kappa_n = self.kappa_history + n
-        self.kappa_history = torch.cat([self.kappa0.unsqueeze(0), kappa_n], dim=0)
-
-    @staticmethod
-    def init_from_data(data, reset_prior_on_changepoint):
-
-        if not torch.is_tensor(data):
-            data = torch.tensor(data)
+    @classmethod
+    def init_from_data(
+        cls,
+        data: TensorLike,
+        reset_prior_on_changepoint: bool = False,
+        *,
+        regularization: float = 1e-6,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype = torch.float64,
+    ) -> "MultivariateGaussianWishartModel":
+        """Initialize prior parameters from a matrix of observations."""
+        data = torch.as_tensor(data, device=device, dtype=dtype)
+        if data.ndim != 2:
+            raise ValueError("data must be a two-dimensional array.")
+        if data.shape[0] < 2:
+            raise ValueError("at least two observations are required to initialize from data.")
 
         mean = torch.mean(data, dim=0)
-        precision = torch.linalg.inv(torch.cov(torch.transpose(data, 1, 0)))
-
-        model = MultivariateGaussianWishartModel(
+        precision = cls._precision_from_data_static(data, regularization=regularization)
+        return cls(
             mu0=mean,
-            kappa0=data.shape[0],
-            nu0=mean.shape[0],
+            kappa0=float(data.shape[0]),
+            nu0=float(mean.shape[0]),
             T0=precision,
-            reset_prior_on_changepoint=reset_prior_on_changepoint
+            reset_prior_on_changepoint=reset_prior_on_changepoint,
+            regularization=regularization,
+            device=data.device,
+            dtype=dtype,
         )
 
-        # print('init_from_data', data.shape, mean.shape, precision.shape)
-        
-        return model
+    def _regularized_precision(self, precision: torch.Tensor) -> torch.Tensor:
+        if self.regularization == 0:
+            return precision
+        eye = torch.eye(self.d, device=self.device, dtype=self.dtype)
+        return precision + self.regularization * eye.unsqueeze(0)
+
+    def _precision_from_data(self, data: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+        try:
+            return self._precision_from_data_static(data, regularization=self.regularization)
+        except RuntimeError:
+            return fallback
+
+    @staticmethod
+    def _precision_from_data_static(data: torch.Tensor, regularization: float) -> torch.Tensor:
+        covariance = torch.cov(data.T)
+        eye = torch.eye(covariance.shape[0], device=data.device, dtype=data.dtype)
+        covariance = covariance + regularization * eye
+        return torch.linalg.pinv(covariance)

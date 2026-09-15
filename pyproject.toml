@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multivariate-bocd"
+version = "0.1.0"
+description = "Multivariate Bayesian online changepoint detection with a Gaussian-Wishart predictive model."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Alejandro Murillo-Gonzalez"}
+]
+keywords = [
+  "bayesian-online-changepoint-detection",
+  "changepoint-detection",
+  "robotics",
+  "online-learning",
+  "multivariate-statistics",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+examples = ["matplotlib>=3.7"]
+dev = ["pytest>=7", "build>=1.0", "twine>=5.0"]
+
+[project.urls]
+Homepage = "https://github.com/AlejandroMllo/multivariate_bocd"
+Repository = "https://github.com/AlejandroMllo/multivariate_bocd"
+Paper = "https://doi.org/10.1177/02783649261431863"
+Related-Source = "https://github.com/AlejandroMllo/situationally_aware_dynamics_learning"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+multivariate_bocd = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

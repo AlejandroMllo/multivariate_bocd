@@ -1,15 +1,9 @@
-"""Runnable WAM-V orientation example.
-
-For repository users, ``examples/wamv_orientation.py`` contains the same workflow.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
 
-from .datasets import load_wamv_orientation
-from .mbocd import BOCD, MultivariateGaussianWishartModel
-from .plotting import plot_run_lengths
+from multivariate_bocd import BOCD, MultivariateGaussianWishartModel, load_wamv_orientation
+from multivariate_bocd.plotting import plot_run_lengths
 
 
 def main() -> None:
@@ -30,9 +24,8 @@ def main() -> None:
 
     output_dir = Path("outputs")
     output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / "wamv_bocd.png"
-    plot_run_lengths(bocd, inference_data, show=False, save_path=str(output_path))
-    print(f"Saved plot to {output_path}")
+    plot_run_lengths(bocd, inference_data, show=False, save_path=str(output_dir / "wamv_bocd.png"))
+    print(f"Saved plot to {output_dir / 'wamv_bocd.png'}")
 
 
 if __name__ == "__main__":
